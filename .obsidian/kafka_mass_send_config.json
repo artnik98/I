@@ -1,0 +1,39 @@
+{
+  "_help": {
+    "requests": "Какие запросы отправлять: file — имя файла из папки requests_dir, count — сколько раз его отправить. Всего сообщений = сумма count",
+    "requests_dir": "Папка с шаблонами запросов, путь относительно этого конфига",
+    "accounts": "Пул ЛС: для каждого сообщения ЛС выбирается случайно из этого массива",
+    "random_seed": "null — каждый запуск случайный (использованный seed пишется в лог и allure). Число — повторить тот же выбор ЛС",
+    "placeholders": "В шаблонах запросов и key_template подставляются: {account} — выбранный ЛС; {uuid} — новый UUID на каждое вхождение; {index} — порядковый номер сообщения (с 1); {now} — текущее время (2026-10-08T14:07:12.203+03:00), одно на всё сообщение; {end_of_month} — последний день текущего месяца 23:59:59.000; \"{charges_total}\" — значение целиком заменяется числом: сумма data.charges[].totalAmount.amount",
+    "key": "Если key_template задан (не null) — ключ строится по нему, иначе берётся значение из сообщения по пути key_field (через точку, индексы массивов числом: data.charges.0.externalId)",
+    "headers": "Kafka headers: {\"content-type\": \"application/cloudevents+json\"}. Пустой объект — без headers",
+    "percent": "Допустимый процент недоставленных сообщений / сообщений без ответа. 0 — любая потеря роняет тест"
+  },
+  "topic": "ebill-charging-events",
+  "requests_dir": "requests_kafka",
+  "requests": [
+    { "file": "charges_created_1_service.json", "count": 1 },
+    { "file": "charges_created_2_services.json", "count": 1 }
+  ],
+  "accounts": [
+    "277300062226"
+  ],
+  "random_seed": null,
+  "key_field": "data.billingAccountId",
+  "key_template": null,
+  "headers": {},
+  "utc_offset_hours": 3,
+  "producer_config": {
+    "acks": "all",
+    "linger.ms": 5
+  },
+  "flush_timeout_seconds": 120,
+  "max_delivery_fail_percent": 0,
+  "response": {
+    "topic": "ebill-charging-events-registered",
+    "timeout_seconds": 60,
+    "correlation_id_field": "data.correlationId",
+    "max_missing_percent": 0
+  },
+  "allure_attach_limit": 20
+}
