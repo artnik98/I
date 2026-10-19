@@ -61,7 +61,11 @@ def load_requests(config, config_path=CONFIG_PATH):
             raise ValueError(f"У запроса {file_name} count должен быть больше 0")
         file_path = os.path.join(requests_dir, file_name)
         if not os.path.exists(file_path):
-            raise ValueError(f"Файл запроса не найден: {file_path}")
+            available = sorted(os.listdir(requests_dir)) if os.path.isdir(requests_dir) else None
+            raise ValueError(
+                f"Файл запроса не найден: {file_path}. "
+                + (f"Папки {requests_dir} нет — проверьте, что она закоммичена"
+                   if available is None else f"Файлы в папке: {available}"))
         with open(file_path, encoding='utf-8') as f:
             requests.append({'file': file_name, 'count': count, 'template': json.load(f)})
     return requests
