@@ -26,7 +26,7 @@ from tests.api.rest.kafka_helper import create_kafka_consumer, create_kafka_prod
 CONFIG_PATH = os.environ.get('KAFKA_MASS_SEND_CONFIG') or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), 'kafka_mass_send_config.json')
 
-PLACEHOLDER_RE = re.compile(r'\{(account|uuid|index|now|end_of_month)\}')
+PLACEHOLDER_RE = re.compile(r'\{(account|uuid|index|run|now|end_of_month)\}')
 UUID_RE = re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
 CHARGES_TOTAL_PLACEHOLDER = '{charges_total}'
 
@@ -46,6 +46,8 @@ def load_config(path=CONFIG_PATH):
         raise ValueError(f"Массив requests в конфиге {path} пуст — укажите хотя бы один запрос")
     if not config.get('key_template') and not config.get('key_field'):
         raise ValueError("Укажите key_field или key_template")
+    if '{key_field}' in (config.get('key_template') or '') and not config.get('key_field'):
+        raise ValueError("key_template содержит {key_field}, но key_field не задан")
     return config
 
 
@@ -78,7 +80,26 @@ def get_by_path(obj, path):
     return obj
 
 
-def render_template(template, account, index, tz):
+def next_run_number(config, config_path=CONFIG_PATH):
+    """Номер запуска: в GitLab — номер пайплайна (CI_PIPELINE_IID), локально — счётчик в файле +1."""
+    ci_number = os.environ.get('CI_PIPELINE_IID')
+    if ci_number:
+        return int(ci_number)
+
+    counter_path = os.path.join(os.path.dirname(os.path.abspath(config_path)),
+                                config.get('run_counter_file', 'kafka_run_counter.txt'))
+    try:
+        with open(counter_path, encoding='utf-8') as f:
+            last = int(f.read().strip())
+    except (FileNotFoundError, ValueError):
+        last = 0
+    number = last + 1
+    with open(counter_path, 'w', encoding='utf-8') as f:
+        f.write(str(number))
+    return number
+
+
+def render_template(template, account, index, tz, run=''):
     """Рекурсивно подставляет плейсхолдеры во все строки шаблона."""
     now = datetime.now(tz)
     last_day = calendar.monthrange(now.year, now.month)[1]
@@ -86,6 +107,7 @@ def render_template(template, account, index, tz):
     values = {
         'account': str(account),
         'index': str(index),
+        'run': str(run),
         'now': now.isoformat(timespec='milliseconds'),
         'end_of_month': end_of_month.isoformat(timespec='milliseconds'),
     }
@@ -126,10 +148,19 @@ def _fill_charges_total(message):
     return walk(message)
 
 
-def build_key(config, message, account, index, tz):
-    if config.get('key_template'):
-        return render_template(config['key_template'], account, index, tz)
-    return str(get_by_path(message, config['key_field']))
+def build_key(config, message, account, index, tz, run=''):
+    """key_template (если задан) с подстановкой {key_field} — значения из сообщения по key_field."""
+    field_value = str(get_by_path(message, config['key_field'])) if config.get('key_field') else ''
+    template = config.get('key_template')
+    if not template:
+        return field_value
+    return render_template(template.replace('{key_field}', field_value), account, index, tz, run)
+
+
+def build_response_key(config, message, sent_key):
+    """Ожидаемый ключ ответа: значение из отправленного сообщения по response.key_field, иначе ключ отправки."""
+    field = config['response'].get('key_field')
+    return str(get_by_path(message, field)) if field else sent_key
 
 
 def _start_from_end(consumer, partitions):
@@ -204,6 +235,7 @@ def test_kafka_mass_send():
     if seed is None:
         seed = random.randrange(10 ** 9)
     rng = random.Random(seed)
+    run_number = next_run_number(config)
     response_cfg = config['response']
     response_topic = response_cfg['topic']
     corr_field = response_cfg.get('correlation_id_field', 'data.correlationId')
@@ -211,9 +243,9 @@ def test_kafka_mass_send():
     headers = list((config.get('headers') or {}).items()) or None
     attach_limit = int(config.get('allure_attach_limit', 20))
 
-    _attach_json(dict(config, random_seed_used=seed), "Конфиг")
+    _attach_json(dict(config, random_seed_used=seed, run_number=run_number), "Конфиг")
     print(f"\n[MassSend] Топик: {topic}, ЛС в пуле: {len(accounts)}, всего сообщений: {total}, "
-          f"random_seed: {seed}")
+          f"random_seed: {seed}, номер запуска: {run_number}")
     for r in requests:
         print(f"[MassSend]   запрос {r['file']}: {r['count']} шт.")
 
@@ -246,14 +278,15 @@ def test_kafka_mass_send():
                 for _ in range(request['count']):
                     index += 1
                     account = rng.choice(accounts)
-                    message = render_template(request['template'], account, index, tz)
-                    key = build_key(config, message, account, index, tz)
+                    message = render_template(request['template'], account, index, tz, run_number)
+                    key = build_key(config, message, account, index, tz, run_number)
                     corr_id = str(get_by_path(message, corr_field))
                     pair = (key, corr_id)
                     assert pair not in sent, (
                         f"Повтор ключа и correlationId {pair} в {request['file']} — "
                         f"используйте {{uuid}} в {corr_field}")
-                    sent[pair] = {'request': request['file'], 'account': account}
+                    sent[pair] = {'request': request['file'], 'account': account,
+                                  'response_key': build_response_key(config, message, key)}
                     examples.setdefault(request['file'], message)
 
                     _produce(
@@ -350,7 +383,8 @@ def test_kafka_mass_send():
                               f"value[:300]={text[:300]!r}")
                     continue
 
-                expected_key, expected_corr = pending_by_corr[matched_corr]
+                sent_key, expected_corr = pending_by_corr[matched_corr]
+                expected_key = sent[(sent_key, expected_corr)]['response_key']
                 if _normalize(key) != _normalize(expected_key):
                     diag['expected_key'] = expected_key
                     diag['expected_correlationId'] = expected_corr
@@ -360,7 +394,7 @@ def test_kafka_mass_send():
                     continue
 
                 del pending_by_corr[matched_corr]
-                found[(expected_key, expected_corr)] = parsed
+                found[(sent_key, expected_corr)] = parsed
                 print(f"[MassSend] ✅ Ответ: key={key}, correlationId={expected_corr}")
 
             pending = list(pending_by_corr.values())
