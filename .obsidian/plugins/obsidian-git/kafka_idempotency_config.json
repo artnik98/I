@@ -1,0 +1,40 @@
+{
+  "_help": {
+    "идея": "Каждое сообщение отправляется, тест ждёт ответ на него, затем отправляет побайтово такое же сообщение (тот же ключ, id, correlationId, externalId, даты) ещё repeats - 1 раз. Ожидается ровно один ответ на сообщение",
+    "requests": "Какие запросы проверять: file — имя файла из папки requests_dir (общая с массовой отправкой), count — сколько разных сообщений сделать из этого шаблона",
+    "accounts": "ЛС берутся по очереди в порядке массива, у каждого запроса очередь начинается с первого ЛС",
+    "repeats": "Сколько раз всего отправить каждое сообщение, включая оригинал. 2 — оригинал + один повтор",
+    "key_template": "Ключ сообщения: {run} — номер запуска (в GitLab — CI_PIPELINE_IID, локально — счётчик в run_counter_file), {key_field} — значение из сообщения по пути key_field",
+    "response.timeout_seconds": "Сколько ждать ответы на оригиналы. Если на какой-то оригинал ответа нет — тест падает, проверять повтор не имеет смысла",
+    "response.duplicate_wait_seconds": "Сколько слушать топик ответов после повтора. Тест всегда ждёт это время целиком, чтобы убедиться, что лишних ответов нет",
+    "response.key_field": "С каким ключом ожидается ответ: значение из отправленного сообщения по этому пути. null — тот же ключ, что у отправленного сообщения"
+  },
+  "topic": "ebill-charging-events",
+  "requests_dir": "requests_kafka",
+  "requests": [
+    { "file": "charges_created_1_services.json", "count": 1 },
+    { "file": "charges_created_2_services.json", "count": 1 }
+  ],
+  "accounts": [
+    "277300062226"
+  ],
+  "repeats": 2,
+  "key_field": "data.billingAccountId",
+  "key_template": "test_Idem{run}_{key_field}",
+  "run_counter_file": "kafka_idempotency_run_counter.txt",
+  "headers": {},
+  "utc_offset_hours": 3,
+  "producer_config": {
+    "acks": "all",
+    "linger.ms": 5
+  },
+  "flush_timeout_seconds": 120,
+  "response": {
+    "topic": "ebill-charging-events-registered",
+    "timeout_seconds": 60,
+    "duplicate_wait_seconds": 60,
+    "correlation_id_field": "data.correlationId",
+    "key_field": "data.billingAccountId"
+  },
+  "allure_attach_limit": 20
+}
