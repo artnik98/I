@@ -2,14 +2,16 @@
 Тест: Проверка идемпотентности — повторная отправка одинаковых сообщений в Kafka.
 
 Каждое сообщение отправляется один раз, тест дожидается ответа на него, после чего отправляет
-побайтово такое же сообщение (тот же ключ, id, correlationId, externalId, даты) ещё repeats - 1 раз.
-Ожидается, что на повторы сервис больше не ответит: ровно один ответ на сообщение.
+побайтово такое же сообщение (тот же ключ, id, correlationId, externalId, даты) ещё repeats - 1 раз,
+каждый раз дожидаясь ответа. Ожидается ровно repeats ответов на сообщение, и ответы на повторы
+должны совпадать с ответом на оригинал (без учёта полей из response.ignore_fields).
 
 Шаблоны запросов берутся из папки requests_kafka (общая с тестом массовой отправки),
 настройки — из kafka_idempotency_config.json (путь можно переопределить переменной окружения
 KAFKA_IDEMPOTENCY_CONFIG). ЛС берутся из accounts по очереди, у каждого запроса с первого ЛС.
 """
 import calendar
+import copy
 import json
 import os
 import re
@@ -240,21 +242,21 @@ def _send_batch(producer, topic, items, headers, flush_timeout):
     return errors
 
 
-def _collect_responses(consumer, expected, corr_field, timeout_seconds, stop_when_all_found, log_limit):
+def _collect_responses(consumer, expected, corr_field, timeout_seconds, state, target_count, log_limit):
     """
-    Читает топик ответов и раскладывает ответы по correlationId из expected.
+    Читает топик ответов и дописывает ответы в state по correlationId из expected.
     expected: {нормализованный correlationId: {'corr', 'response_key', ...}}.
-    stop_when_all_found=True — остановиться, как только на каждое сообщение есть хотя бы один ответ;
-    False — слушать весь timeout_seconds (нужно, чтобы убедиться, что лишних ответов нет).
+    state: {'responses', 'key_mismatches', 'unmatched', 'checked'} — копится между вызовами.
+    target_count — остановиться, как только на каждое сообщение пришло столько ответов;
+    None — слушать весь timeout_seconds (нужно, чтобы убедиться, что лишних ответов нет).
     """
-    responses = {c: [] for c in expected}
-    key_mismatches = {c: [] for c in expected}
-    unmatched = []
-    checked = 0
+    responses = state['responses']
+    key_mismatches = state['key_mismatches']
+    unmatched = state['unmatched']
     deadline = time.time() + timeout_seconds
 
     while time.time() < deadline:
-        if stop_when_all_found and all(responses.values()):
+        if target_count and all(len(r) >= target_count for r in responses.values()):
             break
         msg = consumer.poll(timeout=min(5.0, max(0.1, deadline - time.time())))
         if msg is None:
@@ -264,7 +266,7 @@ def _collect_responses(consumer, expected, corr_field, timeout_seconds, stop_whe
                 print(f"[Idempotency] ⚠️ {msg.error()}")
             continue
 
-        checked += 1
+        state['checked'] += 1
         key = msg.key().decode('utf-8', errors='replace') if msg.key() else None
         text = msg.value().decode('utf-8', errors='replace') if msg.value() else ''
         headers_dict = _decode_headers(msg)
@@ -309,7 +311,47 @@ def _collect_responses(consumer, expected, corr_field, timeout_seconds, stop_whe
         print(f"[Idempotency] ✅ Ответ №{len(responses[matched_corr])}: key={key}, "
               f"correlationId={exp['corr']}")
 
-    return responses, key_mismatches, unmatched, checked
+
+def _drop_paths(obj, paths):
+    """Копия obj без полей по путям через точку (индексы массивов числом). Отсутствующие пути пропускаются."""
+    result = copy.deepcopy(obj)
+    for path in paths:
+        parts = path.split('.')
+        try:
+            parent = get_by_path(result, '.'.join(parts[:-1])) if len(parts) > 1 else result
+            last = parts[-1]
+            if isinstance(parent, list):
+                del parent[int(last)]
+            elif isinstance(parent, dict):
+                parent.pop(last, None)
+        except (KeyError, IndexError, TypeError, ValueError):
+            continue
+    return result
+
+
+def _diff(original, repeat, path=''):
+    """Список отличий двух JSON-структур: [{'path', 'original', 'repeat'}, ...]."""
+    if isinstance(original, dict) and isinstance(repeat, dict):
+        differences = []
+        for k in list(original) + [k for k in repeat if k not in original]:
+            sub = f"{path}.{k}" if path else str(k)
+            if k not in repeat:
+                differences.append({'path': sub, 'original': original[k], 'repeat': '<нет поля>'})
+            elif k not in original:
+                differences.append({'path': sub, 'original': '<нет поля>', 'repeat': repeat[k]})
+            else:
+                differences.extend(_diff(original[k], repeat[k], sub))
+        return differences
+    if isinstance(original, list) and isinstance(repeat, list):
+        differences = []
+        if len(original) != len(repeat):
+            differences.append({'path': f"{path} (длина)", 'original': len(original), 'repeat': len(repeat)})
+        for i, (a, b) in enumerate(zip(original, repeat)):
+            differences.extend(_diff(a, b, f"{path}.{i}" if path else str(i)))
+        return differences
+    if original != repeat:
+        return [{'path': path or '<корень>', 'original': original, 'repeat': repeat}]
+    return []
 
 
 # @allure.id("")  # TODO: указать номер теста из TestOps
@@ -322,7 +364,7 @@ def _collect_responses(consumer, expected, corr_field, timeout_seconds, stop_whe
 @allure.label("Приоритет теста", "Средний")
 @allure.label("Статус автоматизации", "Автоматизирован")
 def test_kafka_idempotency():
-    """Отправляет сообщение, ждёт ответ, повторяет его побайтово и проверяет, что второго ответа нет."""
+    """Отправляет сообщение repeats раз, ждёт ответ на каждую отправку и сравнивает ответы с первым."""
     config = load_config()
     requests = load_requests(config)
     topic = config['topic']
@@ -334,6 +376,7 @@ def test_kafka_idempotency():
     corr_field = response_cfg.get('correlation_id_field', 'data.correlationId')
     response_timeout = response_cfg.get('timeout_seconds', 60)
     duplicate_wait = response_cfg.get('duplicate_wait_seconds', 60)
+    ignore_fields = response_cfg.get('ignore_fields', ['id', 'time'])
     flush_timeout = config.get('flush_timeout_seconds', 120)
     tz = timezone(timedelta(hours=config.get('utc_offset_hours', 3)))
     headers = list((config.get('headers') or {}).items()) or None
@@ -384,72 +427,98 @@ def test_kafka_idempotency():
                 _attach_json(errors[:attach_limit], "Ошибки доставки оригиналов")
             assert not errors, f"Не все оригиналы доставлены: {errors[:5]}"
 
-        with allure.step(f"Ожидание ответов на оригиналы ({response_timeout}с)"):
-            first, first_mismatch, first_unmatched, first_checked = _collect_responses(
-                consumer, expected, corr_field, response_timeout,
-                stop_when_all_found=True, log_limit=attach_limit)
-            without_response = [expected[c] for c, r in first.items() if not r]
-            print(f"[Idempotency] Ответов на оригиналы: {len(originals) - len(without_response)}"
-                  f"/{len(originals)}, проверено сообщений в топике: {first_checked}")
-            _attach_json([
-                {'request': expected[c]['request'], 'key': expected[c]['key'],
-                 'correlationId': expected[c]['corr'], 'responses': r}
-                for c, r in list(first.items())[:attach_limit]
-            ], "Ответы на оригиналы")
-            if first_unmatched:
-                _attach_json(first_unmatched, "Несопоставленные сообщения (оригиналы)")
-            if any(first_mismatch.values()):
-                _attach_json({expected[c]['corr']: d for c, d in first_mismatch.items() if d},
-                             "Совпал correlationId, но ключ другой (оригиналы)")
-            assert not without_response, (
-                f"Нет ответа на {len(without_response)} из {len(originals)} оригиналов за "
-                f"{response_timeout}с — проверить идемпотентность невозможно: "
-                f"{[(o['key'], o['corr']) for o in without_response[:5]]}")
+        state = {
+            'responses': {c: [] for c in expected},
+            'key_mismatches': {c: [] for c in expected},
+            'unmatched': [],
+            'checked': 0,
+        }
 
-        with allure.step(f"Повторная отправка тех же сообщений ({repeats - 1} раз(а))"):
-            for attempt in range(1, repeats):
-                print(f"[Idempotency] Повтор {attempt}/{repeats - 1}")
+        def wait_responses(target_count, title):
+            _collect_responses(consumer, expected, corr_field, response_timeout, state,
+                               target_count=target_count, log_limit=attach_limit)
+            missing = [o for c, o in expected.items() if len(state['responses'][c]) < target_count]
+            print(f"[Idempotency] {title}: ответ получен на {len(expected) - len(missing)}/{len(expected)}, "
+                  f"проверено сообщений в топике: {state['checked']}")
+            if missing:
+                _attach_json([{'request': o['request'], 'key': o['key'], 'correlationId': o['corr'],
+                               'ответов получено': len(state['responses'][_normalize(o['corr'])])}
+                              for o in missing[:attach_limit]], f"Без ответа: {title}")
+                if state['unmatched']:
+                    _attach_json(state['unmatched'], "Несопоставленные сообщения из топика ответов")
+            assert not missing, (
+                f"{title}: нет ответа на {len(missing)} из {len(expected)} сообщений за {response_timeout}с: "
+                f"{[(o['key'], o['corr']) for o in missing[:5]]}")
+
+        with allure.step(f"Ожидание ответов на оригиналы ({response_timeout}с)"):
+            wait_responses(1, "Оригинал")
+
+        for attempt in range(1, repeats):
+            with allure.step(f"Повтор {attempt}/{repeats - 1}: отправка тех же сообщений "
+                             f"и ожидание ответов ({response_timeout}с)"):
                 errors = _send_batch(producer, topic, originals, headers, flush_timeout)
                 if errors:
                     _attach_json(errors[:attach_limit], f"Ошибки доставки повтора {attempt}")
                 assert not errors, f"Не все повторы доставлены (повтор {attempt}): {errors[:5]}"
+                wait_responses(attempt + 1, f"Повтор {attempt}")
 
-        with allure.step(f"Проверка, что на повторы нет новых ответов ({duplicate_wait}с)"):
-            extra, extra_mismatch, extra_unmatched, extra_checked = _collect_responses(
-                consumer, expected, corr_field, duplicate_wait,
-                stop_when_all_found=False, log_limit=attach_limit)
+        with allure.step(f"Проверка, что лишних ответов нет ({duplicate_wait}с)"):
+            _collect_responses(consumer, expected, corr_field, duplicate_wait, state,
+                               target_count=None, log_limit=attach_limit)
 
+        with allure.step("Сравнение ответов на повторы с ответом на оригинал"):
+            responses = state['responses']
+            key_mismatches = state['key_mismatches']
             summary = []
-            violations = []
+            count_violations = []
+            content_violations = []
             for c, o in expected.items():
+                base = _drop_paths(responses[c][0], ignore_fields)
+                diffs_by_repeat = {}
+                for n, r in enumerate(responses[c][1:], start=1):
+                    diff = _diff(base, _drop_paths(r, ignore_fields))
+                    if diff:
+                        diffs_by_repeat[f"ответ {n + 1}"] = diff[:attach_limit]
                 row = {
                     'request': o['request'],
                     'account': o['account'],
                     'key': o['key'],
                     'correlationId': o['corr'],
-                    'ответов на оригинал': len(first[c]),
-                    'ответов после повтора': len(extra[c]),
-                    'с другим ключом после повтора': len(extra_mismatch[c]),
+                    'ожидалось ответов': repeats,
+                    'получено ответов': len(responses[c]),
+                    'с другим ключом': len(key_mismatches[c]),
+                    'ответов с отличиями от первого': len(diffs_by_repeat),
                 }
                 summary.append(row)
-                if len(first[c]) + len(extra[c]) + len(extra_mismatch[c]) != 1:
-                    violations.append(row)
+                if len(responses[c]) != repeats or key_mismatches[c]:
+                    count_violations.append(row)
+                if diffs_by_repeat:
+                    content_violations.append({**row, 'отличия': diffs_by_repeat})
 
-            print(f"[Idempotency] Проверено сообщений в топике после повтора: {extra_checked}, "
-                  f"нарушений идемпотентности: {len(violations)}/{len(expected)}")
+            print(f"[Idempotency] Проверено сообщений в топике: {state['checked']}, "
+                  f"неверное число ответов: {len(count_violations)}/{len(expected)}, "
+                  f"ответы отличаются: {len(content_violations)}/{len(expected)}")
             _attach_json(summary[:attach_limit], "Итог по сообщениям")
-            if any(extra.values()):
-                _attach_json({expected[c]['corr']: r for c, r in extra.items() if r},
-                             "Лишние ответы после повтора")
-            if any(extra_mismatch.values()):
-                _attach_json({expected[c]['corr']: d for c, d in extra_mismatch.items() if d},
-                             "Совпал correlationId, но ключ другой (после повтора)")
-            if extra_unmatched:
-                _attach_json(extra_unmatched, "Несопоставленные сообщения (после повтора)")
+            _attach_json([
+                {'request': o['request'], 'key': o['key'], 'correlationId': o['corr'],
+                 'responses': responses[c]}
+                for c, o in list(expected.items())[:attach_limit]
+            ], "Все ответы по сообщениям")
+            if content_violations:
+                _attach_json(content_violations[:attach_limit], "Отличия ответов на повтор от ответа на оригинал")
+            if any(key_mismatches.values()):
+                _attach_json({expected[c]['corr']: d for c, d in key_mismatches.items() if d},
+                             "Совпал correlationId, но ключ другой")
+            if state['unmatched']:
+                _attach_json(state['unmatched'], "Несопоставленные сообщения из топика ответов")
 
-            assert not violations, (
-                f"Идемпотентность нарушена для {len(violations)} из {len(expected)} сообщений: "
-                f"ожидался ровно 1 ответ. Примеры: {violations[:5]}")
+            assert not count_violations, (
+                f"Неверное число ответов для {len(count_violations)} из {len(expected)} сообщений: "
+                f"ожидалось ровно {repeats} (по одному на каждую отправку). Примеры: {count_violations[:5]}")
+            assert not content_violations, (
+                f"Ответы на повтор отличаются от ответа на оригинал для {len(content_violations)} "
+                f"из {len(expected)} сообщений (без учёта {ignore_fields}). "
+                f"Примеры: {content_violations[:3]}")
 
     finally:
         if producer is not None:
