@@ -1,0 +1,77 @@
+{
+  "id": "{uuid}",
+  "source": "/ep/charging/",
+  "specversion": "1.0",
+  "type": "ru.mts.ep.billing.v1.charges.created",
+  "datacontenttype": "application/json",
+  "dataschema": null,
+  "subject": "{account}",
+  "time": "{now}",
+  "data": {
+    "correlationId": "{uuid}",
+    "billingAccountId": "{account}",
+    "chargeDate": "{now}",
+    "eventDate": "{now}",
+    "charges": [
+      {
+        "externalId": "{uuid}",
+        "chargeType": "ONETIME",
+        "totalAmount": {
+          "amount": 11.00,
+          "currency": "RUB"
+        },
+        "chargeContext": {
+          "action": "ADD",
+          "productId": "cdd4d164-efbg45-5c47-a637-2449def7a555",
+          "quantity": {
+            "amount": 1,
+            "unit": "ITEM"
+          },
+          "pricePerUnit": {
+            "amount": 11.00,
+            "currency": "RUB"
+          },
+          "optionalAttributes": [
+            {
+              "category": "BillingService",
+              "key": "billingServiceCode",
+              "name": "Код биллинговой услуги",
+              "value": "CB402280"
+            }
+          ]
+        }
+      }
+    ],
+    "payments": [
+      {
+        "amount": {
+          "amount": "{charges_total}",
+          "currency": "RUB"
+        },
+        "externalPaymentId": "{number:13}",
+        "methodType": "BANK_CARD",
+        "paymentDate": "{now}",
+        "optionalAttributes": [
+          {
+            "category": "Payment",
+            "key": "payForm",
+            "name": "Банковская карта VISA (E-WALLET интернет платеж с сайта МТС)",
+            "value": "121"
+          },
+          {
+            "category": "Payment",
+            "key": "uprsExtReceiverCode",
+            "name": "uprsExtReceiverCode",
+            "value": "1484459953"
+          },
+          {
+            "category": "Payment",
+            "key": "uprsMemberCode",
+            "name": "uprsMemberCode",
+            "value": "138020"
+          }
+        ]
+      }
+    ]
+  }
+}
